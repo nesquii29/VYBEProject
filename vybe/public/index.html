@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>VYBE</title>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700&family=Unbounded:wght@600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=4">
+  <script>
+    onerror = function (m) {
+      var d = document.createElement('div');
+      d.style.cssText = 'position:fixed;left:0;right:0;top:0;background:#c0392b;color:#fff;padding:10px;z-index:99;font:14px sans-serif';
+      d.textContent = 'Ошибка скрипта: ' + m;
+      (document.body || document.documentElement).append(d);
+    };
+  </script>
+</head>
+<body>
+<div class="app">
+  <nav class="side" aria-label="Разделы">
+    <div class="logo">VY<span>BE</span></div>
+    <div class="nav" id="nav"></div>
+  </nav>
+  <main id="view"></main>
+  <aside id="panel" class="panel" hidden>
+    <div class="tabs" id="tabs"></div>
+    <div class="pbody" id="pbody"></div>
+  </aside>
+  <footer id="bar" class="bar" hidden>
+    <div class="b-l" id="bl">
+      <div class="cov"><div class="eq" id="eq"><i></i><i></i><i></i><i></i></div></div>
+      <div class="meta"><div class="t" id="bT">Трек не выбран</div><div class="s mu" id="bS"></div></div>
+    </div>
+    <div class="b-c">
+      <button type="button" id="bPP" class="ico big" aria-label="Играть / пауза" disabled></button>
+      <div class="prog">
+        <span id="t1">0:00</span>
+        <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Перемотка" disabled>
+        <span id="t2">0:00</span>
+      </div>
+    </div>
+    <div class="b-r">
+      <button type="button" id="bMute" class="ico" aria-label="Выключить звук"></button>
+      <input id="vol" type="range" min="0" max="100" aria-label="Личная громкость">
+      <button type="button" id="bPanel" class="ico" aria-label="Панель комнаты" hidden></button>
+    </div>
+  </footer>
+</div>
+<audio id="au" preload="auto"></audio>
+<dialog id="mdl"><h2 id="mt"></h2><div id="mb"></div></dialog>
+<script type="module" src="main.js?v=4"></script>
+</body>
+</html>
