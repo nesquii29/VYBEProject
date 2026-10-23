@@ -1,10 +1,10 @@
 // Оболочка: навигация, разделы, комнаты, обзор, друзья, настройки, окна
-import { S, $, el, api, send, ic, connect, canControl } from './core.js';
-import { onState, stopAudio, updateBar } from './player.js';
+import { S, $, el, api, send, ic, connect, canControl, canRoom } from './core.js';
+import { onState, stopAudio, updateBar, playPersonal } from './player.js';
 
 const ROUTES = [['home', 'Главная', 'home'], ['discover', 'Обзор', 'compass'], ['rooms', 'Комнаты', 'rooms'], ['messages', 'Сообщения', 'chat'], ['profile', 'Профиль', 'user']];
 const MOODS = [['Спокойно', '#6C8BFF'], ['Заряд', '#FF6B9A'], ['Ночь', '#A27BFF']];
-let panelOpen = true, tab = 'who', timer = null, dt = null;
+let panelOpen = true, tab = 'queue', timer = null, dt = null, lastSeq = -1, guard = null;
 let joinErr = '', failed = 0, joining = 0;
 const D = { q: '', sort: 'active', tag: '', playing: false };
 
@@ -19,8 +19,36 @@ const sec = (title, ...k) => { const s = el('section', '', 'sec'); s.append(el('
 const empty = (text, ...a) => { const d = el('div', '', 'empty'); d.append(el('span', text), ...a); return d; };
 const item = (title, sub, ...a) => { const d = el('div', '', 'item'), t = el('div', '', 'grow'); t.append(el('div', title, 'tt'), el('div', sub, 'mu s')); d.append(t, row(...a)); return d; };
 const copy = async (text, ask) => { try { await navigator.clipboard.writeText(text); return true; } catch { prompt(ask, text); return false; } };
+const avaEl = (name, url, cls = '') => { // круглый аватар или буква-заглушка
+  const a = el('div', url ? '' : (name || '?')[0].toUpperCase(), 'ava ' + cls);
+  if (url) { const i = el('img'); i.src = url; i.alt = ''; a.append(i); }
+  return a;
+};
 const recent = () => JSON.parse(localStorage.getItem('recent') || '[]');
 const flash = (t) => { $('#bS').textContent = t; setTimeout(updateBar, 3000); };
+
+// ---------- Уведомления и выпадающее меню ----------
+function toast(text, kind = '') {
+  const t = el('div', text, 'toast ' + kind);
+  $('#toasts').append(t);
+  setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 250); }, 4000);
+}
+function menu(anchor, items) {
+  document.querySelectorAll('.menu').forEach((m) => m.remove());
+  const m = el('div', '', 'menu');
+  m.setAttribute('role', 'menu');
+  items.forEach(([label, fn, off]) => { const b = btn(label, () => { m.remove(); fn(); }); b.setAttribute('role', 'menuitem'); b.disabled = !!off; m.append(b); });
+  anchor.parentElement.append(m);
+  const bs = [...m.querySelectorAll('button:not(:disabled)')];
+  if (bs[0]) bs[0].focus();
+  m.onkeydown = (e) => {
+    const i = bs.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); bs[(i + 1) % bs.length].focus(); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); bs[(i - 1 + bs.length) % bs.length].focus(); }
+    else if (e.key === 'Escape') { m.remove(); anchor.focus(); }
+  };
+}
+document.addEventListener('click', (e) => { if (!e.target.closest('.menu') && !e.target.closest('[aria-haspopup]')) document.querySelectorAll('.menu').forEach((m) => m.remove()); });
 
 // ---------- Тема и настроение ----------
 const setTheme = (t) => { document.documentElement.dataset.theme = t; localStorage.setItem('theme', t); };
@@ -41,6 +69,13 @@ function modal(title, build) {
   build($('#mb'), () => d.close());
   if (!d.open) { try { d.showModal(); } catch { d.setAttribute('open', ''); } }
 }
+// Клик по затемнённому фону закрывает окно (Escape закрывает его штатно)
+$('#mdl').addEventListener('click', (e) => {
+  const d = e.currentTarget, r = d.getBoundingClientRect();
+  if ((e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) && (!guard || guard())) d.close();
+});
+$('#mdl').addEventListener('cancel', (e) => { if (guard && !guard()) e.preventDefault(); });
+$('#mdl').addEventListener('close', () => { guard = null; $('#mdl').classList.remove('wide'); });
 const field = (label, node) => { const d = el('div'); d.append(el('label', label, 'lbl'), node); return d; };
 const inp = (ph, val = '', type = 'text') => { const i = el('input'); i.type = type; i.placeholder = ph; i.value = val; return i; };
 const sel = (opts, val) => { const s = el('select'); opts.forEach(([v, t]) => s.add(new Option(t, v))); s.value = val; return s; };
@@ -98,8 +133,10 @@ function roomModal(room) {
 const loadRooms = async () => { S.rooms = await api('/api/rooms'); };
 const loadTracks = async () => { S.tracks = await api('/api/tracks'); };
 const loadFriends = async () => { S.friends = await api('/api/friends'); };
+const loadHome = async () => { S.home = await api('/api/home'); };
+const loadStreaks = async () => { S.streaks = Object.fromEntries((await api('/api/streaks')).map((x) => [x.id, x])); };
 async function refresh() {
-  await Promise.all([loadRooms(), loadFriends()]).catch(() => {});
+  await Promise.all([loadRooms(), loadFriends(), loadHome(), loadStreaks()]).catch(() => {});
   if (S.cur) { const f = S.rooms.find((x) => x.id === S.cur.id); if (f) S.cur = f; } // подхватываем изменения настроек
   if (!document.activeElement.closest('#view input, #view textarea')) render();
 }
@@ -111,7 +148,8 @@ async function joinRoom(id, key) {
   try {
     const r = await api('/api/rooms/' + id + '/join', 'POST', key ? { invite: key } : {});
     leaveRoom(false);
-    S.cur = r; S.st = {};
+    S.cur = r; S.st = {}; S.q = null;
+    chatView(); chatStatus();
     send({ type: 'join', room: id });
     localStorage.setItem('recent', JSON.stringify([id, ...recent().filter((x) => x !== id)].slice(0, 8)));
     if (key) history.replaceState(null, '', '#/room/' + id); // ключ приглашения убираем из адресной строки
@@ -122,6 +160,7 @@ async function joinRoom(id, key) {
 }
 function leaveRoom(notify = true) {
   if (S.cur && notify) send({ type: 'leave' });
+  chatReset();
   S.cur = null;
   stopAudio();
 }
@@ -133,30 +172,282 @@ function friendRow(f) {
   const a = [];
   if (pend && f.dir === 'in') a.push(btn('Принять', async () => { await api('/api/friends/' + f.id + '/accept', 'POST'); refresh(); }, 'pri'));
   if (!pend && f.room) a.push(btn('Зайти', () => open(f.room), 'pri'));
+  if (!pend) {
+    const sv = (S.streaks || {})[f.id] || { current: 0, longest: 0 };
+    const sb = btn(String(sv.current), () => streakModal(f), 'chip streak' + (sv.current ? ' on' : ''));
+    sb.insertAdjacentHTML('afterbegin', ic('flame', 14));
+    sb.title = sv.current ? 'Серия с ' + f.name + ': ' + sv.current + ' дн.' : sv.longest ? 'Серия прервана. Нажмите, чтобы узнать подробности' : 'Серии пока нет. Нажмите, чтобы узнать, как её начать';
+    sb.setAttribute('aria-label', 'Серия прослушивания с ' + f.name + ': ' + sv.current + ' дн.');
+    a.push(sb);
+  }
   a.push(btn(pend ? (f.dir === 'in' ? 'Отклонить' : 'Отмена') : 'Удалить', async () => { await api('/api/friends/' + f.id, 'DELETE'); refresh(); }));
-  return item(f.name + ' #' + f.tag, st, ...a);
+  const r = item('', st, ...a), t = r.querySelector('.tt'), l = el('a', f.display_name || f.name);
+  l.href = '#/user/' + f.id; l.style.color = 'inherit';
+  t.append(l, document.createTextNode(' #' + f.tag));
+  r.insertBefore(avaEl(f.display_name || f.name, f.avatar), r.firstChild);
+  return r;
 }
 
-function uploadBtn() {
-  const l = el('label', 'Загрузить mp3', 'btn pri'), i = inp('', '', 'file');
+// ---------- Профиль ----------
+const GENRE_LABELS = { 'hip-hop': 'Хип-хоп', rap: 'Рэп', pop: 'Поп', electronic: 'Электроника', rock: 'Рок', indie: 'Инди', rnb: 'R&B', jazz: 'Джаз', ambient: 'Эмбиент', classical: 'Классика', metal: 'Метал', alternative: 'Альтернатива', other: 'Другое' };
+const PRESET_LABELS = { listening: '🎧 Слушаю музыку', late: '🌙 Поздний вайб', gaming: '🎮 Играю', studying: '📚 Учусь', away: '💤 Отошёл', thoughts: '💭 Задумался', available: '✨ На связи', dnd: '🔕 Не беспокоить' };
+const ACCENT_LIST = [['lavender', 'Лаванда', '#9AA5FF'], ['blue', 'Синий', '#6FA8FF'], ['mint', 'Мята', '#6FD0A8'], ['pink', 'Розовый', '#F08DB2'], ['amber', 'Янтарь', '#F0B35C'], ['rose', 'Роза', '#E87979']];
+
+async function onProfileEvent(id) {
+  try {
+    if (id === S.me.id) { S.me = { ...S.me, ...(await api('/api/me')) }; renderMe(); }
+    await loadFriends();
+  } catch {}
+  const r = route();
+  if ((r.p === 'user' && r.id === id) || (r.p === 'profile' && id === S.me.id) || r.p === 'messages' || r.p === 'home') render();
+}
+function userPage(id) { const slot = el('div'); showProfile(slot, id); return page(slot); }
+async function showProfile(slot, id) {
+  slot.append(el('div', '', 'skel'));
+  try { slot.replaceChildren(profileCard(await api('/api/profile/' + id))); }
+  catch (e) { slot.replaceChildren(empty(e.message, btn('На главную', () => go('#/home')))); }
+}
+
+function favTrack(t, own) {
+  const d = el('div', '', 'trk'), art = el('div', '', 'art'), info = el('div', '', 'grow'), can = !t.unavailable && (t.source === 'soundcloud' || own);
+  if (t.art) { const im = el('img'); im.src = t.art; im.alt = ''; im.loading = 'lazy'; art.append(im); } else art.innerHTML = ic('note', 20);
+  info.append(el('div', t.title, 'tt'), el('div', t.unavailable ? 'Трек недоступен' : t.artist || (t.source === 'upload' ? 'Моя загрузка' : ''), 'mu s'));
+  d.append(art, info, el('span', t.source === 'soundcloud' ? 'SoundCloud' : 'MP3', 'chip'));
+  if (can) {
+    const pl = btn('', () => (S.cur ? toast('Вы в комнате. Выйдите из неё, чтобы послушать трек лично.') : playPersonal(t)), 'ico');
+    pl.innerHTML = ic('play', 18); pl.title = 'Слушать (только у вас)'; pl.setAttribute('aria-label', 'Слушать: ' + t.title);
+    d.append(pl);
+  }
+  if (t.source === 'soundcloud' && t.url) { // официальная ссылка на источник
+    const a = el('a', 'Открыть', 'chip'); a.href = t.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; a.setAttribute('aria-label', 'Открыть на SoundCloud: ' + t.title);
+    d.append(a);
+  }
+  return d;
+}
+
+function profileCard(p) {
+  const own = p.rel === 'me', root = el('div', '', 'pf st-' + p.style), ban = el('div', '', 'pf-ban');
+  root.style.setProperty('--pa', p.accent); // цвет проверен сервером, это только значение переменной
+  if (p.banner) ban.style.backgroundImage = 'url("' + p.banner + '")';
+  const head = el('div', '', 'pf-head'), av = avaEl(p.display_name, p.avatar, 'xl'), info = el('div', '', 'grow'), acts = row();
+  if (p.online) { const d = el('i', '', 'on'); d.title = 'В сети'; av.append(d); }
+  info.append(el('h1', p.display_name), el('p', '@' + p.name + ' · #' + p.tag, 'mu s'));
+  if (p.status) info.append(el('span', p.status, 'chip pf-st'));
+  if (p.bio) info.append(el('p', p.bio, 'pf-bio'));
+  else if (own) info.append(el('p', 'Расскажите о себе в редакторе профиля.', 'mu s'));
+  if (own) acts.append(btn('Редактировать профиль', () => editProfile(p), 'pri'));
+  if (p.streak) {
+    const sb = btn(String(p.streak.current), () => streakModal({ id: p.id, name: p.display_name }), 'chip streak' + (p.streak.current ? ' on' : ''));
+    sb.insertAdjacentHTML('afterbegin', ic('flame', 14)); sb.setAttribute('aria-label', 'Общая серия: ' + p.streak.current + ' дн.');
+    acts.append(sb);
+  }
+  if (p.activity && p.activity.state === 'room') acts.append(btn('Зайти в комнату', () => open(p.activity.room), 'pri'));
+  info.append(acts);
+  head.append(av, info);
+  root.append(ban, head);
+  if (p.activity) {
+    const a = p.activity;
+    root.append(el('p', a.state === 'room' ? (a.playing && a.track ? 'Слушает «' + a.track.title + '»' + (a.track.artist ? ' — ' + a.track.artist : '') : 'В комнате «' + a.room.name + '»') : 'Сейчас ничего не слушает', 'mu pf-act'));
+  }
+  const edit = () => editProfile(p);
+  if (p.featured) { const f = el('div', '', 'pf-feat'); f.append(el('div', 'Избранный трек', 'lbl'), favTrack(p.featured, own)); root.append(f); }
+  else if (own) root.append(empty('Выберите избранный трек, он появится здесь крупной карточкой.', btn('Выбрать', edit)));
+  if (p.genres && p.genres.length) { const g = el('div', '', 'row'); p.genres.forEach((x) => g.append(el('span', GENRE_LABELS[x] || x, 'gen'))); root.append(g); }
+  else if (own) root.append(empty('Отметьте любимые жанры.', btn('Выбрать', edit)));
+  if (p.tracks && p.tracks.length) { const l = el('div'); p.tracks.forEach((t) => l.append(favTrack(t, own))); root.append(el('h2', 'На повторе'), l); }
+  else if (own) root.append(empty('Добавьте любимые треки (до 10) из своей библиотеки.', btn('Добавить', edit)));
+  return root;
+}
+
+async function editProfile(p) {
+  try { await loadTracks(); } catch {}
+  const st = { accent: p.accent, style: p.style, genres: new Set(p.genres || []), vis: { ...p.vis }, avatar: null, banner: null, rmAva: false, rmBan: false, clearStatus: false, favs: (p.tracks || []).map((t) => t.id), featured: p.featured ? p.featured.id : null };
+  let dirty = false;
+  const mark = () => { dirty = true; };
+  modal('Редактировать профиль', (b, close) => {
+    $('#mdl').classList.add('wide');
+    guard = () => !dirty || confirm('Закрыть без сохранения? Изменения будут потеряны.');
+    const f = el('form'), msg = el('p', '', 'msg'), s2 = (title, ...k) => { const d = el('div', '', 'edsec'); d.append(el('h2', title), ...k); return d; };
+    msg.setAttribute('role', 'status');
+    const counter = (i, max) => { const c = el('span', '', 'mu s'); const u = () => { c.textContent = i.value.length + '/' + max; }; i.addEventListener('input', u); u(); return c; };
+    const toggle = (t, on, fn) => { const x = btn(t, () => { fn(); x.setAttribute('aria-pressed', String(!(x.getAttribute('aria-pressed') === 'true'))); mark(); }, 'gb'); x.setAttribute('aria-pressed', String(on)); return x; };
+
+    // Основное
+    const name = inp('Имя', p.display_name), bio = el('textarea');
+    name.maxLength = 32; bio.maxLength = 160; bio.value = p.bio || ''; bio.placeholder = 'О себе (необязательно)';
+    const basic = s2('Основное', field('Отображаемое имя', name), counter(name, 32), field('О себе', bio), counter(bio, 160), el('p', 'Логин @' + p.name + ' и тег #' + p.tag + ' не меняются.', 'mu s'));
+
+    // Аватар и баннер
+    const imgField = (label, cur, mb, key, rmKey) => {
+      const w = el('div'), pv = el('img'), file = inp('', '', 'file');
+      pv.className = 'pf-pv'; pv.alt = 'Предпросмотр: ' + label; if (cur) pv.src = cur; else pv.hidden = true;
+      file.accept = 'image/jpeg,image/png,image/webp'; file.setAttribute('aria-label', label);
+      file.onchange = () => { const x = file.files[0]; if (!x) return; if (x.size > mb * 1048576) { toast('Файл больше ' + mb + ' МБ', 'err'); file.value = ''; return; } st[key] = x; st[rmKey] = false; pv.src = URL.createObjectURL(x); pv.hidden = false; mark(); };
+      w.append(el('label', label + ' (JPEG, PNG или WebP, до ' + mb + ' МБ)', 'lbl'), pv, row(file, btn('Убрать', () => { st[key] = null; st[rmKey] = true; pv.hidden = true; file.value = ''; mark(); })));
+      return w;
+    };
+    const media = s2('Аватар и баннер', imgField('Аватар', p.avatar, 5, 'avatar', 'rmAva'), imgField('Баннер', p.banner, 8, 'banner', 'rmBan'));
+
+    // Статус
+    const preset = sel([['', 'Свой вариант']].concat(Object.entries(PRESET_LABELS)), ''), text = inp('Или своё сообщение', ''), hours = sel([['0', 'Без срока'], ['1', '1 час'], ['8', '8 часов'], ['24', '24 часа']], '0');
+    text.maxLength = 60;
+    const stRow = [field('Готовый статус', preset), field('Своё сообщение', text), counter(text, 60), field('Сколько показывать', hours)];
+    if (p.status) stRow.unshift(el('p', 'Сейчас: ' + p.status, 'mu'), btn('Очистить статус', () => { st.clearStatus = true; mark(); toast('Статус будет очищен при сохранении'); }));
+    const status = s2('Статус', ...stRow, el('p', 'Статус не влияет на присутствие: «Не беспокоить» не делает вас «не в сети».', 'mu s'));
+
+    // Оформление
+    const custom = inp('Свой цвет, например #8C9BFF', ''), sw = el('div', '', 'row');
+    ACCENT_LIST.forEach(([k, label, hex]) => { const x = btn('', () => { st.accent = k; custom.value = ''; sw.querySelectorAll('.sw').forEach((y) => y.setAttribute('aria-pressed', String(y === x))); mark(); }, 'sw'); x.style.background = hex; x.title = label; x.setAttribute('aria-label', 'Цвет: ' + label); x.setAttribute('aria-pressed', String(hex === p.accent)); sw.append(x); });
+    const style = sel([['minimal', 'Минимальный'], ['midnight', 'Полночь'], ['artist', 'Артист']], p.style);
+    const look = s2('Оформление', sw, field('Свой цвет (необязательно)', custom), field('Стиль профиля', style));
+
+    // Жанры
+    const gs = el('div', '', 'row');
+    Object.entries(GENRE_LABELS).forEach(([k, label]) => gs.append(toggle(label, st.genres.has(k), () => { if (st.genres.has(k)) st.genres.delete(k); else if (st.genres.size >= 5) { toast('Не больше 5 жанров', 'err'); throw new Error('limit'); } else st.genres.add(k); })));
+    const genres = s2('Любимые жанры (до 5)', gs);
+
+    // Избранные треки
+    const favBox = el('div');
+    const drawFavs = () => {
+      favBox.replaceChildren();
+      const byId = new Map(S.tracks.map((t) => [t.id, t]));
+      st.favs = st.favs.filter((id) => byId.has(id) || (p.tracks || []).some((t) => t.id === id));
+      st.favs.forEach((id, i) => {
+        const t = byId.get(id) || p.tracks.find((x) => x.id === id), r = el('div', '', 'item');
+        const radio = inp('', '', 'radio'); radio.name = 'feat'; radio.checked = st.featured === id; radio.style.cssText = 'width:auto;min-height:0;margin:0'; radio.setAttribute('aria-label', 'Избранный трек: ' + t.title);
+        radio.onchange = () => { st.featured = id; mark(); };
+        const tt = el('div', '', 'grow'); tt.append(el('div', t.title, 'tt'), el('div', (t.source === 'soundcloud' ? 'SoundCloud' : 'MP3, виден только вам') + (st.featured === id ? ' · избранный' : ''), 'mu s'));
+        const mv = (d) => () => { const j = i + d; if (j < 0 || j >= st.favs.length) return; [st.favs[i], st.favs[j]] = [st.favs[j], st.favs[i]]; mark(); drawFavs(); };
+        const up = btn('↑', mv(-1)), dn = btn('↓', mv(1)), rm = btn('✕', () => { st.favs.splice(i, 1); if (st.featured === id) st.featured = null; mark(); drawFavs(); });
+        up.setAttribute('aria-label', 'Выше'); dn.setAttribute('aria-label', 'Ниже'); rm.setAttribute('aria-label', 'Убрать из избранного'); up.disabled = i === 0; dn.disabled = i === st.favs.length - 1;
+        r.append(radio, tt, row(up, dn, rm)); favBox.append(r);
+      });
+      const rest = S.tracks.filter((t) => !st.favs.includes(t.id));
+      if (rest.length) { favBox.append(el('p', 'Добавить из библиотеки (' + st.favs.length + ' из 10)', 'lbl')); rest.forEach((t) => { const a = btn('Добавить', () => { st.favs.push(t.id); mark(); drawFavs(); }); a.disabled = st.favs.length >= 10; favBox.append(item(t.title, t.source === 'soundcloud' ? 'SoundCloud' : 'MP3 (виден только вам)', a)); }); }
+      else if (!st.favs.length) favBox.append(empty('В библиотеке пока нет треков. Загрузите MP3 или добавьте трек SoundCloud на главной.'));
+    };
+    drawFavs();
+    const favs = s2('Избранные треки', el('p', 'Отметьте кружком избранный трек. Ваши MP3 другие пользователи не увидят и не смогут послушать.', 'mu s'), favBox);
+
+    // Приватность
+    const vis = {}, V = [['everyone', 'Все'], ['friends', 'Только друзья'], ['me', 'Только я']];
+    const priv = s2('Приватность');
+    [['bio', 'О себе'], ['genres', 'Жанры'], ['tracks', 'Избранные треки'], ['featured', 'Избранный трек'], ['activity', 'Что слушаю сейчас']].forEach(([k, label]) => { vis[k] = sel(V, st.vis[k]); vis[k].onchange = () => { st.vis[k] = vis[k].value; }; priv.append(field(label, vis[k])); });
+
+    f.append(basic, media, status, look, genres, favs, priv, msg);
+    const save = el('button', 'Сохранить', 'pri'), cancel = btn('Отмена', () => { if (guard()) close(); });
+    f.append(row(save, cancel));
+    f.addEventListener('input', mark); f.addEventListener('change', mark);
+    f.onsubmit = async (ev) => {
+      ev.preventDefault();
+      save.disabled = true; save.setAttribute('aria-busy', 'true'); msg.className = 'msg'; msg.textContent = 'Сохраняю…';
+      const errs = [], run = async (label, fn) => { try { await fn(); } catch (e) { errs.push(label + ': ' + e.message); } };
+      const body = { display_name: name.value, bio: bio.value, style: style.value, genres: [...st.genres], accent: custom.value.trim() || st.accent };
+      Object.entries(st.vis).forEach(([k, v]) => { body['vis_' + k] = v; });
+      if (st.clearStatus) body.status = null; else if (preset.value || text.value.trim()) body.status = { preset: preset.value || undefined, text: text.value, hours: +hours.value };
+      const upload = async (kind, file) => { const fd = new FormData(); fd.append('file', file); await api('/api/profile/' + kind, 'PUT', fd); };
+      await run('Профиль', () => api('/api/profile', 'PUT', body));
+      if (st.avatar) await run('Аватар', () => upload('avatar', st.avatar)); else if (st.rmAva) await run('Аватар', () => api('/api/profile/avatar', 'DELETE'));
+      if (st.banner) await run('Баннер', () => upload('banner', st.banner)); else if (st.rmBan) await run('Баннер', () => api('/api/profile/banner', 'DELETE'));
+      await run('Избранное', () => api('/api/profile/favorites', 'PUT', { tracks: st.favs, featured: st.featured }));
+      save.disabled = false; save.removeAttribute('aria-busy');
+      if (errs.length) { msg.className = 'msg err'; msg.textContent = 'Не всё сохранено. ' + errs.join(' · '); return; } // успешные части уже сохранены, окно остаётся открытым
+      dirty = false; close(); toast('Профиль сохранён', 'ok');
+      S.me = { ...S.me, ...(await api('/api/me')) }; renderMe(); render();
+    };
+    b.append(f);
+  });
+}
+
+async function streakModal(f) {
+  let d;
+  try { d = await api('/api/streaks/' + f.id); } catch (e) { return toast(e.message, 'err'); }
+  modal('Серия с ' + f.name, (b, close) => {
+    const state = d.current ? 'Серия активна' : d.longest ? 'Серия прервана. Она начнётся заново, когда вы снова послушаете вместе' : 'Серии пока нет';
+    const list = el('div', '', 'row');
+    d.days.forEach((x) => list.append(el('span', x, 'chip')));
+    b.append(el('h1', d.current + ' дн.'), el('p', state, 'mu'),
+      el('p', 'Рекорд: ' + d.longest + ' дн. · Последний общий день: ' + (d.last || '—'), 'mu s'),
+      el('p', d.today ? 'Сегодня уже засчитано.' : 'Сегодня: ' + d.progress + ' из ' + d.rules.minutes + ' мин совместного прослушивания.'),
+      el('h2', 'Последние общие дни'), d.days.length ? list : el('p', 'Пока нет общих дней.', 'mu s'),
+      el('h2', 'Как засчитывается день'),
+      el('p', 'Вы оба в одной комнате, где играет музыка, и вместе набрали не меньше ' + d.rules.minutes + ' минут за сутки по UTC. Время считает сервер по тому, кто подключён и играет ли комната. Подтвердить, что звук реально слышен, он не может. Если пропустить целые сутки, серия начнётся заново, рекорд сохранится. Бонусов за пропуск нет.', 'mu s'),
+      row(btn('Закрыть', close, 'pri')));
+    b.children[0].style.marginBottom = 'var(--s2)';
+  });
+}
+
+function uploadBtn(cls = 'pri') {
+  const l = el('label', 'Загрузить MP3', 'btn ' + cls), i = inp('', '', 'file');
   i.accept = '.mp3,audio/mpeg'; i.hidden = true;
   i.onchange = async () => {
     const f = i.files[0];
     if (!f) return;
     const fd = new FormData();
     fd.append('file', f);
-    try { await api('/api/tracks', 'POST', fd); await loadTracks(); render(); } catch (e) { alert(e.message); }
+    try { await api('/api/tracks', 'POST', fd); await loadTracks(); render(); } catch (e) { toast(e.message, 'err'); }
   };
   l.append(i);
   return l;
 }
 
+// Единый компонент строки трека (библиотека, комната, профиль)
+function trackRow(t) {
+  const room = canRoom(), solo = !S.cur, d = el('div', '', 'trk'), art = el('div', '', 'art'), info = el('div', '', 'grow');
+  if (t.art) { const im = el('img'); im.src = t.art; im.alt = ''; im.loading = 'lazy'; art.append(im); } else art.innerHTML = ic('note', 20);
+  info.append(el('div', t.title, 'tt'), el('div', t.artist || 'Моя загрузка', 'mu s'));
+  const now = () => (S.cur ? send({ type: 'track', id: t.id }) : playPersonal(t));
+  const play = btn('', now, 'ico play');
+  play.innerHTML = ic('play', 18);
+  play.title = solo ? 'Слушать (только у вас)' : room ? 'Играть сейчас в комнате' : 'В этой комнате воспроизведением управляет хозяин';
+  play.setAttribute('aria-label', 'Слушать: ' + t.title);
+  play.disabled = !(solo || room);
+  const more = btn('', () => menu(more, [
+    ['В очередь комнаты', () => send({ type: 'qadd', track: t.id }), !room],
+    [solo ? 'Слушать (только у вас)' : 'Играть сейчас', now, !(solo || room)],
+    ['Удалить из библиотеки', () => removeTrack(t)],
+  ]), 'ico');
+  more.innerHTML = ic('more', 20);
+  more.setAttribute('aria-label', 'Действия с треком');
+  more.setAttribute('aria-haspopup', 'menu');
+  const wrap = el('div', '', 'rel');
+  wrap.append(more);
+  d.append(art, info, el('span', t.source === 'soundcloud' ? 'SoundCloud' : 'MP3', 'chip'), play, wrap);
+  return d;
+}
+async function removeTrack(t) {
+  if (!confirm('Удалить «' + t.title + '» из библиотеки?')) return;
+  try { await api('/api/tracks/' + t.id, 'DELETE'); await loadTracks(); render(); toast('Трек удалён', 'ok'); } catch (e) { toast(e.message, 'err'); }
+}
 function trackRows(list) {
   const box = el('div');
-  list.forEach((t) => {
-    const play = btn('В комнату', () => send({ type: 'track', id: t.id }), 'pri');
-    play.disabled = !canControl();
-    box.append(item(t.title, 'mp3', play, btn('Удалить', async () => { await api('/api/tracks/' + t.id, 'DELETE'); await loadTracks(); render(); })));
+  list.forEach((t) => box.append(trackRow(t)));
+  return box;
+}
+
+// Вкладка «Очередь»: текущий трек, дальше по порядку; кнопки только тем, у кого есть право
+function queueView() {
+  if (S.q === null) return el('p', 'Загрузка очереди…', 'mu');
+  const box = el('div'), ctl = canControl(), now = el('div', '', 'qnow');
+  if (S.st.seq !== lastSeq) { now.classList.add('swap'); lastSeq = S.st.seq; }
+  now.append(el('div', S.st.track ? S.st.track.title : 'Сейчас ничего не играет', 'tt'), el('div', S.st.track ? 'Добавил ' + (S.st.by || '—') : 'Комната ждёт трек', 'mu s'));
+  box.append(el('div', 'Сейчас играет', 'lbl'), now);
+  if (ctl && S.st.track) box.append(btn('Пропустить', () => send({ type: 'skip' })));
+  box.append(el('div', 'Далее · ' + S.q.length, 'lbl'));
+  if (!S.q.length) box.append(empty(ctl ? 'Очередь пуста. Добавьте треки из своей музыки на странице комнаты.' : 'Очередь пуста.'));
+  S.q.forEach((x, i) => {
+    const r = el('div', '', 'item qi'), t = el('div', '', 'grow'), a = row();
+    t.append(el('div', x.title, 'tt'), el('div', 'добавил ' + x.by, 'mu s'));
+    r.append(t);
+    if (ctl) {
+      const b2 = (g, label, fn, off) => { const b = btn(g, fn); b.title = label; b.setAttribute('aria-label', label); b.disabled = !!off; a.append(b); };
+      b2('▶', 'Играть сейчас', () => send({ type: 'qplay', id: x.id }));
+      b2('↑', 'Выше', () => send({ type: 'qmove', id: x.id, to: i - 1 }), i === 0);
+      b2('↓', 'Ниже', () => send({ type: 'qmove', id: x.id, to: i + 1 }), i === S.q.length - 1);
+      b2('✕', 'Убрать', () => send({ type: 'qremove', id: x.id }));
+      r.append(a);
+    }
+    box.append(r);
   });
   return box;
 }
@@ -190,18 +481,79 @@ function welcome() {
   return page(c);
 }
 
+// Импорт музыки: ссылка SoundCloud (официальный oEmbed на сервере + Widget API в плеере) или свой MP3
+function importCard(onAdded) {
+  const c = el('div', '', 'import'), f = el('form'), box = el('div', '', 'row'), field = el('div', '', 'field'), i = el('input'), msg = el('p', '', 'msg'), go = el('button', 'В очередь', 'pri');
+  c.append(el('h2', 'Принесите свою музыку в VYBE'), el('p', 'Вставьте ссылку на трек SoundCloud или загрузите MP3 из своей библиотеки.', 'mu'));
+  msg.setAttribute('role', 'status');
+  i.type = 'url'; i.placeholder = 'Вставьте ссылку на трек SoundCloud…'; i.autocomplete = 'off'; i.setAttribute('aria-label', 'Ссылка на трек SoundCloud');
+  f.noValidate = true;
+  field.append(el('span', 'SoundCloud', 'chip'), i);
+  box.append(field, go, uploadBtn(''));
+  f.append(box, msg);
+  f.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const url = i.value.trim();
+    if (!url) { msg.className = 'msg err'; msg.textContent = 'Вставьте ссылку на трек'; return i.focus(); }
+    go.disabled = true; go.setAttribute('aria-busy', 'true');
+    msg.className = 'msg'; msg.textContent = 'Проверяю ссылку в SoundCloud…';
+    try {
+      const t = await api('/api/soundcloud', 'POST', { url });
+      await loadTracks();
+      i.value = '';
+      msg.className = 'msg ok'; msg.textContent = 'Найдено: ' + t.title + (t.artist ? ' — ' + t.artist : '') + '. Трек сохранён в вашей библиотеке.';
+      onAdded();
+      if (S.cur && canControl()) { send({ type: 'qadd', track: t.id }); toast('Добавляю в очередь: ' + t.title, 'ok'); }
+      else if (S.cur) toast('Трек сохранён в библиотеке. В этой комнате очередью управляет хозяин.');
+      else toast('Трек сохранён в библиотеке. Зайдите в комнату, чтобы добавить его в очередь.');
+    } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; }
+    go.disabled = false; go.removeAttribute('aria-busy');
+  };
+  c.append(f);
+  return c;
+}
+
+function liveCard(r) {
+  const c = el('div', '', 'trk'), art = el('div', '', 'art'), info = el('div', '', 'grow'), full = r.max && r.online >= r.max && S.me.id !== r.oid;
+  if (r.track && r.track.art) { const im = el('img'); im.src = r.track.art; im.alt = ''; im.loading = 'lazy'; art.append(im); } else art.innerHTML = ic('note', 20);
+  info.append(el('div', r.track ? r.track.title : r.name, 'tt'), el('div', (r.track && r.track.artist ? r.track.artist + ' · ' : '') + r.name + ' · хозяин ' + r.owner + ' · слушают: ' + r.online, 'mu s'));
+  const j = btn(full ? 'Заполнено' : 'Войти', () => open(r), 'pri');
+  j.disabled = !!full;
+  c.append(art, info);
+  if (r.track) c.append(el('span', r.track.source === 'soundcloud' ? 'SoundCloud' : 'MP3', 'chip'));
+  c.append(j);
+  return c;
+}
+function homeLive() {
+  const H = S.home || { listening: [], popular: [], kind: 'score' }, out = [];
+  const l = el('div');
+  if (H.listening.length) H.listening.forEach((r) => l.append(liveCard(r)));
+  else l.append(empty('Сейчас в публичных комнатах никто не слушает музыку.', row(btn('Открыть Обзор', () => go('#/discover')), btn('Создать комнату', () => roomModal(), 'pri'))));
+  out.push(sec('Сейчас слушают', l));
+  if (H.popular.length) {
+    const p = el('div');
+    if (H.kind === 'score') p.append(el('p', 'Рейтинг внутри VYBE: слушатели, играющая музыка и недавняя активность.', 'mu s'));
+    H.popular.forEach((r) => p.append(liveCard(r)));
+    out.push(sec(H.kind === 'score' ? 'Популярное сейчас' : 'Недавно активные комнаты', p));
+  }
+  return out;
+}
+
 function home() {
-  const head = el('div'), acts = row(btn('Создать комнату', () => roomModal(), 'pri'), uploadBtn());
-  head.append(el('h1', 'Привет, ' + S.me.name), el('p', 'Что слушаем сегодня?', 'mu'), acts);
-  acts.style.marginTop = 'var(--s4)';
+  const h = new Date().getHours(), hi = h < 6 ? 'Доброй ночи' : h < 12 ? 'Доброе утро' : h < 18 ? 'Добрый день' : 'Добрый вечер';
+  const head = el('div'), libBox = el('div');
+  head.append(el('h1', hi + ', ' + S.me.name), el('p', 'Что слушаем сегодня?', 'mu'));
+  const lib = () => libBox.replaceChildren(S.tracks.length ? trackRows(S.tracks.slice(0, 8)) : empty('Здесь появятся ваши треки. Вставьте ссылку SoundCloud выше или загрузите MP3.'), ...(S.tracks.length > 8 ? [btn('Вся библиотека', () => go('#/profile'))] : []));
+  lib();
+  const imp = importCard(lib);
+  imp.style.marginTop = 'var(--s5)';
+  const out = [head, imp, ...homeLive()];
   const live = S.friends.filter((f) => f.status === 'ok' && f.room);
-  const fr = live.length ? el('div') : empty('Сейчас никто из друзей не слушает музыку.', btn('Найти друзей', () => go('#/messages')));
-  live.forEach((f) => fr.append(friendRow(f)));
+  if (live.length) { const fr = el('div'); live.forEach((f) => fr.append(friendRow(f))); out.push(sec('Друзья слушают', fr)); }
   const rec = recent().map((id) => S.rooms.find((r) => r.id === id)).filter(Boolean).slice(0, 4);
-  const lib = S.tracks.length ? trackRows(S.tracks.slice(0, 5)) : empty('В библиотеке пока пусто.', uploadBtn());
-  return page(head, sec('Друзья слушают', fr),
-    sec('Недавние комнаты', grid(rec, 'Вы ещё не заходили в комнаты.', btn('Найти в Обзоре', () => go('#/discover')))),
-    sec('Моя музыка', lib, ...(S.tracks.length > 5 ? [btn('Вся библиотека', () => go('#/profile'))] : [])));
+  if (rec.length) out.push(sec('Недавние комнаты', grid(rec, '')));
+  out.push(sec('Моя музыка', libBox));
+  return page(...out);
 }
 
 function discover() {
@@ -260,7 +612,9 @@ function profile() {
   look.append(row(th), row(el('span', 'Настроение комнаты:', 'mu'), ...MOODS.map((m, i) => btn(m[0], () => { setMood(i); render(); }, i === mood ? 'pri' : ''))));
   const libHead = row(uploadBtn());
   libHead.style.marginBottom = 'var(--s3)';
-  const out = [acc, sec('Оформление', look), sec('Моя музыка', libHead, S.tracks.length ? trackRows(S.tracks) : empty('В библиотеке пока пусто.'))];
+  const slot = el('div');
+  showProfile(slot, me.id);
+  const out = [slot, acc, sec('Оформление', look), sec('Моя музыка', libHead, S.tracks.length ? trackRows(S.tracks) : empty('В библиотеке пока пусто.'))];
   if (me.admin) {
     const holder = el('div');
     api('/api/users').then((list) => list.forEach((u) => holder.append(item(u.name + ' #' + u.tag, u.admin ? 'администратор' : 'пользователь',
@@ -306,27 +660,111 @@ function roomPage(id) {
 function roomHead() {
   if (!$('#rTitle')) return;
   $('#rTitle').textContent = S.st.track ? S.st.track.title : 'Трек не выбран';
-  $('#rSub').textContent = S.st.track ? 'Слушают: ' + (S.st.users || 1) : canControl() ? 'Выберите трек ниже' : 'Ждём, пока хозяин выберет трек';
+  $('#rSub').textContent = S.st.track ? 'Слушают: ' + (S.st.users || 1) + (S.st.by ? ' · добавил ' + S.st.by : '') : canControl() ? 'Выберите трек ниже' : 'Ждём, пока хозяин выберет трек';
+}
+
+// ---------- Чат комнаты (сообщения хранятся на сервере, текст выводится только как textContent) ----------
+const chat = { el: null, list: null, note: null, input: null, ids: new Set(), unread: 0, more: false, loaded: false };
+let sendLock = 0;
+const chatVisible = () => route().p === 'room' && !!S.cur && panelOpen && tab === 'chat';
+function chatView() {
+  if (chat.el) return chat.el;
+  const w = el('div', '', 'chat'), f = el('form', '', 'cform'), i = el('textarea');
+  chat.note = el('div'); chat.list = el('div', '', 'msgs');
+  i.rows = 1; i.maxLength = 500; i.placeholder = 'Сообщение…'; i.setAttribute('aria-label', 'Сообщение в чат комнаты');
+  f.append(i, el('button', 'Отправить', 'pri'));
+  f.onsubmit = (ev) => { ev.preventDefault(); sendChat(); };
+  i.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); } };
+  w.append(chat.note, chat.list, f);
+  Object.assign(chat, { el: w, input: i });
+  chatStatus();
+  return w;
+}
+function chatStatus() {
+  if (!chat.note) return;
+  const n = chat.note;
+  n.replaceChildren();
+  if (!chat.loaded) n.append(el('p', 'Загрузка истории…', 'mu s'));
+  else {
+    if (chat.more) n.append(btn('Показать более ранние', () => send({ type: 'chat:older', before: Math.min(...chat.ids) }), 'link'));
+    if (!chat.ids.size) n.append(el('p', 'Пока нет сообщений. Напишите первым!', 'mu s'));
+  }
+  if (!wsOn) n.append(el('p', 'Нет соединения, переподключаюсь…', 'mu s'));
+}
+function chatReset() {
+  chat.ids = new Set(); chat.unread = 0; chat.more = false; chat.loaded = false;
+  if (chat.list) chat.list.replaceChildren();
+  chatStatus();
+  $('#bPanel').classList.remove('dot');
+}
+function addMsg(m, front) {
+  if (!chat.list || chat.ids.has(m.id)) return;
+  chat.ids.add(m.id);
+  const d = el('div', '', 'msg'), a = el('div', m.name[0].toUpperCase(), 'ava sm'), b = el('div', '', 'grow'), h = el('div', '', 'mh');
+  h.append(el('span', m.name, 'mn'), el('span', new Date(m.created).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), 'mu s'));
+  b.append(h, el('div', m.text, 'mt'));
+  d.append(a, b);
+  const l = chat.list, near = l.scrollHeight - l.scrollTop - l.clientHeight < 80;
+  if (front) l.prepend(d); else { l.append(d); if (near || m.uid === S.me.id) l.scrollTop = l.scrollHeight; }
+  if (!front && !m.history && m.uid !== S.me.id && !chatVisible()) { chat.unread++; $('#bPanel').classList.add('dot'); renderPanel(); }
+}
+function sendChat() {
+  const text = chat.input.value.trim();
+  if (!text || Date.now() < sendLock) return;
+  if (!send({ type: 'chat:send', text, cid: Math.random().toString(36).slice(2) })) return toast('Нет соединения. Сообщение не отправлено.', 'err');
+  sendLock = Date.now() + 400; // защита от двойной отправки
+  chat.input.value = '';
+}
+function onChat(m) {
+  if (m.type === 'chat:error') return toast({ empty: 'Пустое сообщение', long: 'Сообщение длиннее 500 символов', rate: 'Слишком часто. Подождите несколько секунд.', perm: 'Нет доступа к чату этой комнаты' }[m.code] || 'Сообщение не отправлено', 'err');
+  if (!S.cur || m.room !== S.cur.id) return;
+  if (m.type === 'chat:message') { addMsg(m); chatStatus(); return; }
+  if (m.type === 'chat:history') {
+    const items = m.older ? [...m.items].reverse() : m.items;
+    items.forEach((x) => addMsg({ ...x, history: true }, m.older));
+    chat.loaded = true; chat.more = m.more;
+    chatStatus();
+    if (!m.older) chat.list.scrollTop = chat.list.scrollHeight;
+  }
 }
 
 // ---------- Правая панель комнаты ----------
 function renderPanel() {
   const { p } = route(), show = p === 'room' && S.cur && panelOpen;
   $('#panel').hidden = !show;
+  document.body.classList.toggle('with-panel', !!show); // плеер SoundCloud сдвигается, чтобы не закрывать чат
   $('#bPanel').hidden = !S.cur;
   if (!show) return;
+  if (tab === 'chat') { chat.unread = 0; $('#bPanel').classList.remove('dot'); }
   $('#tabs').innerHTML = '';
-  [['chat', 'Чат'], ['queue', 'Очередь'], ['who', 'Слушатели']].forEach(([k, t]) => $('#tabs').append(btn(t, () => { tab = k; renderPanel(); }, tab === k ? 'on' : '')));
-  const b = $('#pbody');
+  [['chat', 'Чат'], ['queue', 'Очередь'], ['who', 'Слушатели']].forEach(([k, t]) => $('#tabs').append(btn(t + (k === 'chat' && chat.unread ? ' · ' + chat.unread : ''), () => { tab = k; renderPanel(); }, tab === k ? 'on' : '')));
+  const b = $('#pbody'), keep = b.scrollTop;
+  if (tab === 'chat' && chat.el && b.firstChild === chat.el) return; // не пересобираем чат, чтобы не терять введённый текст
   b.innerHTML = '';
   if (tab === 'who') (S.st.names || []).forEach((n) => b.append(item(n, n === S.cur.owner ? 'хозяин' : n === S.me.name ? 'вы' : 'слушает')));
-  else b.append(empty(tab === 'chat' ? 'Чат комнаты появится на одном из следующих этапов.' : 'Очередь появится на одном из следующих этапов.'));
+  else if (tab === 'queue') b.append(queueView());
+  else b.append(chatView());
+  b.scrollTop = keep;
 }
 $('#bPanel').onclick = () => {
   if (route().p !== 'room') { panelOpen = true; return go('#/room/' + S.cur.id); }
   panelOpen = !panelOpen;
   renderPanel();
 };
+
+// Профиль внизу боковой панели: аватар, имя, тег, статус соединения
+let wsOn = false;
+function renderMe() {
+  const m = $('#me');
+  m.hidden = !S.me;
+  if (!S.me) return;
+  m.innerHTML = '';
+  const a = avaEl(S.me.display_name || S.me.name, S.me.avatar), dot = el('i', '', wsOn ? 'on' : ''), t = el('div', '', 'grow');
+  dot.title = wsOn ? 'В сети' : 'Нет соединения';
+  a.append(dot);
+  t.append(el('div', S.me.display_name || S.me.name, 'tt'), el('div', '#' + S.me.tag, 'mu s'));
+  m.append(a, t);
+}
 
 // ---------- Рендер и маршрутизация ----------
 $('#nav').innerHTML = ROUTES.map(([p, t, i]) => `<a href="#/${p}" data-p="${p}" title="${t}" aria-label="${t}">${ic(i, 22)}<span>${t}</span></a>`).join('');
@@ -339,8 +777,9 @@ function render() {
   else if (p === 'room') {
     v.append(roomPage(id));
     if ((!S.cur || S.cur.id !== id) && failed !== id) joinRoom(id, key);
-  } else v.append(({ home, discover, rooms, messages, profile }[p] || home)());
+  } else v.append(({ home, discover, rooms, messages, profile, user: () => userPage(id) }[p] || home)());
   renderPanel();
+  renderMe();
   updateBar();
 }
 addEventListener('hashchange', () => { failed = 0; $('#bar').classList.remove('full'); render(); });
@@ -350,15 +789,23 @@ function onMsg(m) {
   if (m.type === 'presence') { clearTimeout(timer); timer = setTimeout(refresh, 300); }
   else if (m.type === 'gone') { if (S.cur && S.cur.id === m.room) { leaveRoom(false); go('#/rooms'); } refresh(); }
   else if (m.type === 'error') {
-    if (m.code === 'perm') flash('Управлять воспроизведением может только хозяин комнаты');
+    const msgs = { perm: 'Управлять воспроизведением и очередью может только хозяин комнаты', track: 'Этот трек недоступен', qfull: 'Очередь заполнена (максимум 50 треков)', qmine: 'Вы уже добавили 10 треков' };
+    if (msgs[m.code]) flash(msgs[m.code]);
     else { leaveRoom(false); joinErr = m.code === 'full' ? 'Комната заполнена. Попробуйте позже.' : 'У вас нет доступа к этой комнате.'; failed = m.room; render(); }
-  } else { onState(m); renderPanel(); roomHead(); }
+  } else if (m.type === 'queue') { S.q = m.items; renderPanel(); }
+  else if (m.type === 'profile') onProfileEvent(m.id);
+  else if (m.type === 'streak') {
+    toast(m.milestone ? m.milestone + ' дн. подряд вместе с ' + m.name + '!' : 'Общий день засчитан: серия с ' + m.name + ' — ' + m.current + ' дн.', 'ok');
+    loadStreaks().then(render).catch(() => {});
+  }
+  else if (m.type.startsWith('chat:')) onChat(m);
+  else { onState(m); renderPanel(); roomHead(); }
 }
 
 async function enterApp() {
   S.me = await api('/api/me');
-  connect({ open: () => S.cur && send({ type: 'join', room: S.cur.id }), msg: onMsg });
-  await Promise.all([loadRooms(), loadTracks(), loadFriends()]);
+  connect({ open: () => { wsOn = true; renderMe(); chatStatus(); if (S.cur) send({ type: 'join', room: S.cur.id }); }, close: () => { wsOn = false; renderMe(); chatStatus(); }, msg: onMsg });
+  await Promise.all([loadRooms(), loadTracks(), loadFriends(), loadHome(), loadStreaks()]);
   if (!location.hash) go('#/home');
   render();
 }
