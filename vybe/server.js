@@ -2,6 +2,7 @@ const express = require('express'), http = require('http'), crypto = require('cr
 const path = require('path'), fs = require('fs');
 const streaks = require('./streaks');
 const profile = require('./profile');
+const prefs = require('./prefs');
 const Database = require('better-sqlite3'), multer = require('multer');
 const { WebSocketServer } = require('ws');
 
@@ -107,6 +108,38 @@ if (db.pragma('user_version', { simple: true }) < 6) {
     db.pragma('user_version = 6');
   })();
 }
+
+// ---------- Самовосстановление схемы ----------
+// Номер версии может не совпасть с реальным состоянием базы (например, при ручной замене файлов).
+// Поэтому при каждом запуске недостающие таблицы, индексы и колонки создаются заново; повторный запуск безопасен, данные не затрагиваются.
+function ensureColumns(table, cols) {
+  const have = new Set(db.prepare('PRAGMA table_info(' + table + ')').all().map((c) => c.name));
+  cols.forEach(([name, ddl]) => { if (!have.has(name)) db.exec('ALTER TABLE ' + table + ' ADD COLUMN ' + name + ' ' + ddl); });
+}
+ensureColumns('rooms', [['description', "TEXT NOT NULL DEFAULT ''"], ['visibility', "TEXT NOT NULL DEFAULT 'public'"], ['tags', "TEXT NOT NULL DEFAULT ''"], ['max_users', 'INTEGER NOT NULL DEFAULT 0'], ['control', "TEXT NOT NULL DEFAULT 'all'"], ['invite', 'TEXT'], ['active_at', 'INTEGER NOT NULL DEFAULT 0']]);
+ensureColumns('tracks', [['source', "TEXT NOT NULL DEFAULT 'upload'"], ['url', 'TEXT'], ['artist', 'TEXT'], ['art', 'TEXT']]);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS room_members(room INTEGER, uid INTEGER, PRIMARY KEY(room, uid));
+  CREATE TABLE IF NOT EXISTS room_queue(id INTEGER PRIMARY KEY AUTOINCREMENT, room INTEGER NOT NULL, track INTEGER NOT NULL, uid INTEGER NOT NULL, pos INTEGER NOT NULL, created INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS room_queue_room ON room_queue(room, pos);
+  CREATE TABLE IF NOT EXISTS room_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, room INTEGER NOT NULL, uid INTEGER NOT NULL, text TEXT NOT NULL, created INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS room_messages_room ON room_messages(room, id);
+  CREATE INDEX IF NOT EXISTS rooms_vis ON rooms(visibility, active_at);
+  CREATE TABLE IF NOT EXISTS streaks(a INTEGER NOT NULL, b INTEGER NOT NULL, current INTEGER NOT NULL DEFAULT 0, longest INTEGER NOT NULL DEFAULT 0, last_day TEXT, PRIMARY KEY(a, b), CHECK(a < b));
+  CREATE TABLE IF NOT EXISTS streak_days(a INTEGER NOT NULL, b INTEGER NOT NULL, day TEXT NOT NULL, PRIMARY KEY(a, b, day), CHECK(a < b));
+  CREATE TABLE IF NOT EXISTS streak_progress(a INTEGER NOT NULL, b INTEGER NOT NULL, day TEXT NOT NULL, ms INTEGER NOT NULL, PRIMARY KEY(a, b, day), CHECK(a < b));
+  CREATE INDEX IF NOT EXISTS streaks_b ON streaks(b);
+  CREATE INDEX IF NOT EXISTS streak_days_b ON streak_days(b);
+  CREATE TABLE IF NOT EXISTS profiles(uid INTEGER PRIMARY KEY, display_name TEXT, bio TEXT NOT NULL DEFAULT '', status_text TEXT, status_until INTEGER,
+    accent TEXT NOT NULL DEFAULT '#9AA5FF', style TEXT NOT NULL DEFAULT 'minimal', genres TEXT NOT NULL DEFAULT '', avatar TEXT, banner TEXT, featured INTEGER,
+    vis_bio TEXT NOT NULL DEFAULT 'everyone', vis_genres TEXT NOT NULL DEFAULT 'everyone', vis_tracks TEXT NOT NULL DEFAULT 'everyone',
+    vis_featured TEXT NOT NULL DEFAULT 'everyone', vis_activity TEXT NOT NULL DEFAULT 'friends');
+  CREATE TABLE IF NOT EXISTS profile_favorites(id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL, track INTEGER NOT NULL, pos INTEGER NOT NULL, UNIQUE(uid, track));
+  CREATE INDEX IF NOT EXISTS profile_favorites_uid ON profile_favorites(uid, pos);
+  CREATE INDEX IF NOT EXISTS profile_favorites_track ON profile_favorites(track);
+`);
+ensureColumns('profiles', [['prefs', 'TEXT']]);
+db.prepare('SELECT id FROM rooms WHERE invite IS NULL').all().forEach((r) => db.prepare('UPDATE rooms SET invite = ? WHERE id = ?').run(crypto.randomBytes(8).toString('hex'), r.id));
 
 // ---------- Пользователи и сессии ----------
 const hashPw = (p, salt) => crypto.scryptSync(p, salt, 32).toString('hex');
@@ -365,6 +398,14 @@ app.get('/api/streaks/:id', auth, (req, res) => {
   if (!f || f === me || !areFriends(me, f)) return res.status(404).json({ error: 'Серия не найдена' }); // чужие данные не раскрываются
   const [a, b] = streaks.pair(me, f);
   res.json({ ...streakView(me, f), days: store.days(a, b, 14), rules: { minutes: 10, milestones: streaks.MILESTONES } });
+});
+
+// ---------- Настройки интерфейса (в аккаунте, у каждого пользователя свои) ----------
+app.get('/api/prefs', auth, (req, res) => res.json({ prefs: prefs.get(db, req.user.id) }));
+app.put('/api/prefs', auth, (req, res) => {
+  const r = prefs.validate(req.body);
+  if (r.error) return res.status(400).json({ error: r.error });
+  res.json({ prefs: prefs.set(db, req.user.id, r.v) });
 });
 
 // ---------- Профиль ----------
@@ -733,6 +774,10 @@ setInterval(() => {
 }, 15000);
 setInterval(() => { try { tracker.flush(); } catch (e) { console.error('streaks flush:', e); } }, 60000);
 process.on('SIGINT', () => { try { tracker.flush(); } catch {} process.exit(0); });
+
+// Понятные ответы вместо страниц с ошибкой: клиент показывает их пользователю
+app.use('/api', (req, res) => res.status(404).json({ error: 'Сервер не знает этого запроса. Скорее всего, запущена старая версия server.js: остановите сервер (Control+C) и запустите заново.' }));
+app.use((err, req, res, next) => { console.error('Ошибка запроса', req.method, req.url, err); res.status(500).json({ error: 'Внутренняя ошибка сервера. Подробности смотрите в окне терминала, где запущен сервер.' }); });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log('VYBE запущен: http://localhost:' + PORT));

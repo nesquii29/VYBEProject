@@ -203,3 +203,21 @@ dialog.wide { width:min(640px,94vw); max-height:90vh; overflow:auto; }
 .sw[aria-pressed=true] { border-color:var(--tx); }
 .gb[aria-pressed=true] { background:var(--tx); color:var(--bg); }
 @media (max-width:720px) { .pf-head { grid-template-columns:1fr; } .ava.xl { width:80px; height:80px; margin-top:-40px; } .pf-ban { height:120px !important; } }
+/* ===== Настройки ===== */
+.nav a[data-p=settings] { margin-top:auto; }
+.set { display:grid; grid-template-columns:200px minmax(0,1fr); gap:var(--s5); margin-top:var(--s5); }
+.setnav { display:flex; flex-direction:column; gap:2px; align-self:start; }
+.setnav a { display:flex; align-items:center; min-height:40px; padding:0 var(--s3); border-radius:var(--r2); color:var(--tx2); font-weight:600; text-decoration:none; transition:background var(--t),color var(--t); }
+.setnav a:hover { background:var(--raised); color:var(--tx); } .setnav a.on { background:var(--raised); color:var(--tx); box-shadow:inset 3px 0 var(--ac); }
+.setbody { display:flex; flex-direction:column; gap:var(--s4); min-width:0; }
+.sgroup { margin:0; padding:var(--s5); border:1px solid var(--line); border-radius:var(--r3); background:var(--surface); }
+.sgroup legend { padding:0 var(--s2); font-weight:700; } .sgroup > p { margin-bottom:var(--s3); }
+.opt { position:relative; display:inline-flex; align-items:center; gap:var(--s2); min-height:44px; padding:0 var(--s4); border:1px solid var(--line); border-radius:var(--r2); background:var(--raised); cursor:pointer; transition:border-color var(--t),background var(--t); }
+.opt:hover { border-color:rgba(128,128,140,.5); }
+.opt input { position:absolute; inset:0; width:100%; height:100%; margin:0; opacity:0; cursor:pointer; }
+.opt:has(input:checked) { border-color:var(--ac); }
+.opt:has(input:checked)::after { content:"✓"; font-weight:700; }
+.opt:has(input:focus-visible) { outline:2px solid var(--ac); outline-offset:2px; }
+.dot { width:14px; height:14px; border-radius:50%; box-shadow:inset 0 0 0 1px rgba(128,128,140,.5); }
+[data-motion=reduce] *, [data-motion=reduce] *::before, [data-motion=reduce] *::after { animation:none !important; transition:none !important; }
+@media (max-width:720px) { .set { grid-template-columns:1fr; } .setnav { flex-direction:row; overflow-x:auto; } }

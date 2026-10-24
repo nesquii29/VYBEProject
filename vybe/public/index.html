@@ -5,7 +5,24 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>VYBE</title>
   <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=5">
+  <script>
+    /* vybe-early-theme */
+    (function () {
+      try {
+        var s = null;
+        try { s = JSON.parse(localStorage.getItem('vybe:snap') || 'null'); } catch (e) {}
+        var theme = (s && s.theme) || localStorage.getItem('theme') || 'dark';
+        var dark = theme === 'system' ? matchMedia('(prefers-color-scheme: dark)').matches : theme !== 'light';
+        var r = document.documentElement;
+        r.setAttribute('data-theme', dark ? 'dark' : 'light');
+        if (s && s.motion === 'reduce') r.setAttribute('data-motion', 'reduce');
+        var m = localStorage.getItem('mood');
+        var c = (s && s.accentColor) || (!s && m !== null ? ['#6C8BFF', '#FF6B9A', '#A27BFF'][+m] : null);
+        if (c) r.style.setProperty('--ac', c);
+      } catch (e) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="style.css?v=6">
   <script>
     onerror = function (m) {
       var d = document.createElement('div');
@@ -52,6 +69,6 @@
 <audio id="au" preload="auto"></audio>
 <dialog id="mdl"><h2 id="mt"></h2><div id="mb"></div></dialog>
 <div id="toasts" aria-live="polite"></div>
-<script type="module" src="main.js?v=5"></script>
+<script type="module" src="main.js?v=6"></script>
 </body>
 </html>

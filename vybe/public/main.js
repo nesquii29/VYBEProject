@@ -1,15 +1,15 @@
 // Оболочка: навигация, разделы, комнаты, обзор, друзья, настройки, окна
 import { S, $, el, api, send, ic, connect, canControl, canRoom } from './core.js';
 import { onState, stopAudio, updateBar, playPersonal } from './player.js';
+import * as P from './prefs.js';
 
-const ROUTES = [['home', 'Главная', 'home'], ['discover', 'Обзор', 'compass'], ['rooms', 'Комнаты', 'rooms'], ['messages', 'Сообщения', 'chat'], ['profile', 'Профиль', 'user']];
-const MOODS = [['Спокойно', '#6C8BFF'], ['Заряд', '#FF6B9A'], ['Ночь', '#A27BFF']];
+const ROUTES = [['home', 'Главная', 'home'], ['discover', 'Обзор', 'compass'], ['rooms', 'Комнаты', 'rooms'], ['messages', 'Сообщения', 'chat'], ['profile', 'Профиль', 'user'], ['settings', 'Настройки', 'gear']];
 let panelOpen = true, tab = 'queue', timer = null, dt = null, lastSeq = -1, guard = null;
 let joinErr = '', failed = 0, joining = 0;
 const D = { q: '', sort: 'active', tag: '', playing: false };
 
 // ---------- Помощники ----------
-const route = () => { const [, p = 'home', id, key] = location.hash.split('/'); return { p, id: +id || 0, key: key || '' }; };
+const route = () => { const [, p = 'home', id, key] = location.hash.split('/'); return { p, id: +id || 0, key: key || '', seg: id || '' }; };
 const go = (h) => { location.hash = h; };
 const open = (r) => go('#/room/' + r.id);
 const btn = (t, fn, cls = '') => { const b = el('button', t, cls); b.type = 'button'; b.onclick = fn; return b; };
@@ -50,16 +50,30 @@ function menu(anchor, items) {
 }
 document.addEventListener('click', (e) => { if (!e.target.closest('.menu') && !e.target.closest('[aria-haspopup]')) document.querySelectorAll('.menu').forEach((m) => m.remove()); });
 
-// ---------- Тема и настроение ----------
-const setTheme = (t) => { document.documentElement.dataset.theme = t; localStorage.setItem('theme', t); };
-function setMood(i) {
-  const c = MOODS[i][1], st = document.documentElement.style;
-  localStorage.setItem('mood', i);
-  st.setProperty('--ac', c);
-  st.setProperty('--glow', c + '4D');
+// ---------- Настройки интерфейса: тема, цвет, анимации (хранятся в аккаунте) ----------
+const mqDark = matchMedia('(prefers-color-scheme: dark)'), mqMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const penv = { root: document.documentElement, systemDark: () => mqDark.matches };
+let prefs = (() => { // до входа берём снимок прошлого запуска, иначе прежние настройки из localStorage
+  try { const s = JSON.parse(localStorage.getItem('vybe:snap') || 'null'); if (s) return P.normalize(s); } catch {}
+  return P.fromLegacy(localStorage.getItem('theme'), localStorage.getItem('mood')) || { ...P.DEFAULTS };
+})();
+function commitPrefs(p, uid) {
+  prefs = P.normalize(p);
+  P.saveCached(localStorage, uid, prefs, P.applyPrefs(prefs, penv));
 }
-setTheme(localStorage.getItem('theme') || 'dark');
-if (localStorage.getItem('mood') !== null) setMood(+localStorage.getItem('mood'));
+P.applyPrefs(prefs, penv);
+P.watchSystem(mqDark, () => prefs.theme, () => P.saveCached(localStorage, 0, prefs, P.applyPrefs(prefs, penv))); // смена темы системы при выборе «Как в системе»
+async function loadPrefs() {
+  const c = P.loadCached(localStorage, S.me.id);
+  if (c) commitPrefs(c, S.me.id); // мгновенно: кэш именно этого аккаунта
+  let r = null;
+  try { r = (await api('/api/prefs')).prefs; } catch {}
+  if (!r) { // у аккаунта ещё нет сохранённых настроек: один раз переносим прежние локальные (тема и настроение)
+    const legacy = P.fromLegacy(localStorage.getItem('theme'), localStorage.getItem('mood'));
+    if (legacy) { r = legacy; try { await api('/api/prefs', 'PUT', legacy); localStorage.removeItem('theme'); localStorage.removeItem('mood'); } catch {} }
+  }
+  commitPrefs(r || P.DEFAULTS, S.me.id); // чужие настройки с этого устройства новому аккаунту не передаются
+}
 
 // ---------- Модальные окна ----------
 function modal(title, build) {
@@ -361,7 +375,8 @@ async function editProfile(p) {
 
 async function streakModal(f) {
   let d;
-  try { d = await api('/api/streaks/' + f.id); } catch (e) { return toast(e.message, 'err'); }
+  try { d = await api('/api/streaks/' + f.id); } catch (e) { return toast('Серия: ' + e.message, 'err'); }
+  d.days = d.days || []; d.rules = d.rules || { minutes: 10 };
   modal('Серия с ' + f.name, (b, close) => {
     const state = d.current ? 'Серия активна' : d.longest ? 'Серия прервана. Она начнётся заново, когда вы снова послушаете вместе' : 'Серии пока нет';
     const list = el('div', '', 'row');
@@ -602,14 +617,12 @@ function messages() {
 }
 
 function profile() {
-  const me = S.me, mood = +localStorage.getItem('mood') || 0;
+  const me = S.me;
   const acc = el('div', '', 'card');
   acc.append(el('h1', me.name), el('p', 'Тег: #' + me.tag + (me.admin ? ' · администратор' : ''), 'mu'),
     row(btn('Копировать тег', () => copy('#' + me.tag, 'Ваш тег:')), btn('Выйти', async () => { await api('/api/logout', 'POST'); location.reload(); })));
-  const dark = () => document.documentElement.dataset.theme === 'dark';
-  const th = btn(dark() ? 'Тёмная тема' : 'Светлая тема', () => { setTheme(dark() ? 'light' : 'dark'); th.textContent = dark() ? 'Тёмная тема' : 'Светлая тема'; });
   const look = el('div', '', 'card');
-  look.append(row(th), row(el('span', 'Настроение комнаты:', 'mu'), ...MOODS.map((m, i) => btn(m[0], () => { setMood(i); render(); }, i === mood ? 'pri' : ''))));
+  look.append(el('p', 'Тема, цвет интерфейса и анимации теперь в настройках.', 'mu'), row(btn('Открыть настройки', () => go('#/settings/appearance'))));
   const libHead = row(uploadBtn());
   libHead.style.marginBottom = 'var(--s3)';
   const slot = el('div');
@@ -752,6 +765,55 @@ $('#bPanel').onclick = () => {
   renderPanel();
 };
 
+// ---------- Настройки ----------
+const SET_CATS = [['appearance', 'Оформление']]; // новые разделы (аккаунт, приватность, уведомления…) добавляются сюда
+function radioGroup(name, legend, options, current, onPick, desc) {
+  const fs = el('fieldset', '', 'sgroup'), r = el('div', '', 'row');
+  fs.append(el('legend', legend));
+  if (desc) fs.append(el('p', desc, 'mu s'));
+  options.forEach(([v, label, color]) => {
+    const l = el('label', '', 'opt'), i = el('input');
+    i.type = 'radio'; i.name = name; i.value = v; i.checked = v === current;
+    i.onchange = () => { if (i.checked) onPick(v); };
+    l.append(i);
+    if (color) { const d = el('span', '', 'dot'); d.style.background = color; l.append(d); }
+    l.append(el('span', label));
+    r.append(l);
+  });
+  fs.append(r);
+  return fs;
+}
+function settingsAppearance() {
+  const box = el('div', '', 'setbody'), note = el('p', '', 'msg');
+  note.setAttribute('role', 'status');
+  const say = (t, err) => { note.className = 'msg ' + (err ? 'err' : 'ok'); note.textContent = t; };
+  const save = async (k, v) => {
+    commitPrefs({ ...prefs, [k]: v }, S.me.id); // применяется сразу, без перезагрузки
+    say('Сохраняю…');
+    try { await api('/api/prefs', 'PUT', { [k]: v }); say('Сохранено в вашем аккаунте'); }
+    catch (e) { say('Применено на этом устройстве, но не сохранено: ' + e.message, true); }
+  };
+  const motion = el('fieldset', '', 'sgroup'), lab = el('label', '', 'opt'), cb = el('input');
+  cb.type = 'checkbox'; cb.checked = prefs.motion === 'reduce';
+  cb.onchange = () => save('motion', cb.checked ? 'reduce' : 'system');
+  lab.append(cb, el('span', 'Уменьшить анимации'));
+  motion.append(el('legend', 'Анимации'), el('p', mqMotion.matches ? 'Ваша система уже просит уменьшать анимации, и VYBE это учитывает.' : 'По умолчанию VYBE следует настройке системы. Включите, чтобы уменьшить анимации всегда.', 'mu s'), lab);
+  box.append(
+    radioGroup('theme', 'Тема', [['dark', 'Тёмная'], ['light', 'Светлая'], ['system', 'Как в системе']], prefs.theme, (v) => save('theme', v), 'Вариант «Как в системе» меняется вместе с настройкой вашей операционной системы.'),
+    radioGroup('accent', 'Цвет интерфейса', [['default', 'Стандартный', '#8C9BFF'], ['calm', 'Спокойно', '#6C8BFF'], ['charge', 'Заряд', '#FF6B9A'], ['night', 'Ночь', '#A27BFF']], prefs.accent, (v) => save('accent', v), 'Цвет кнопок и выделений во всём VYBE. Цвет вашего профиля настраивается отдельно, в редакторе профиля.'),
+    motion, note);
+  return box;
+}
+function settingsPage(seg) {
+  const cat = SET_CATS.some((c) => c[0] === seg) ? seg : 'appearance';
+  const wrap = el('div', '', 'set'), nav = el('nav', '', 'setnav'), head = el('div');
+  nav.setAttribute('aria-label', 'Разделы настроек');
+  SET_CATS.forEach(([k, label]) => { const a = el('a', label, k === cat ? 'on' : ''); a.href = '#/settings/' + k; if (k === cat) a.setAttribute('aria-current', 'page'); nav.append(a); });
+  wrap.append(nav, settingsAppearance());
+  head.append(el('h1', 'Настройки'), el('p', 'Оформление VYBE. Настройки сохраняются в вашем аккаунте и действуют на всех устройствах.', 'mu'));
+  return page(head, wrap);
+}
+
 // Профиль внизу боковой панели: аватар, имя, тег, статус соединения
 let wsOn = false;
 function renderMe() {
@@ -769,7 +831,7 @@ function renderMe() {
 // ---------- Рендер и маршрутизация ----------
 $('#nav').innerHTML = ROUTES.map(([p, t, i]) => `<a href="#/${p}" data-p="${p}" title="${t}" aria-label="${t}">${ic(i, 22)}<span>${t}</span></a>`).join('');
 function render() {
-  const { p, id, key } = route();
+  const { p, id, key, seg } = route();
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.p === (p === 'room' ? 'rooms' : p)));
   const v = $('#view');
   v.innerHTML = '';
@@ -777,7 +839,7 @@ function render() {
   else if (p === 'room') {
     v.append(roomPage(id));
     if ((!S.cur || S.cur.id !== id) && failed !== id) joinRoom(id, key);
-  } else v.append(({ home, discover, rooms, messages, profile, user: () => userPage(id) }[p] || home)());
+  } else v.append(({ home, discover, rooms, messages, profile, user: () => userPage(id), settings: () => settingsPage(seg) }[p] || home)());
   renderPanel();
   renderMe();
   updateBar();
@@ -804,6 +866,7 @@ function onMsg(m) {
 
 async function enterApp() {
   S.me = await api('/api/me');
+  await loadPrefs();
   connect({ open: () => { wsOn = true; renderMe(); chatStatus(); if (S.cur) send({ type: 'join', room: S.cur.id }); }, close: () => { wsOn = false; renderMe(); chatStatus(); }, msg: onMsg });
   await Promise.all([loadRooms(), loadTracks(), loadFriends(), loadHome(), loadStreaks()]);
   if (!location.hash) go('#/home');
